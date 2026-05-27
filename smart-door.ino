@@ -7,13 +7,14 @@
 // --- তোমার তথ্য ---
 const char* ssid     = "Pirates";
 const char* password = "Bristy@12345";
-const String serverURL = "http://192.168.1.103:8080/verify";
+const String serverURL = "http://192.168.1.108:8080/verify";
 
 // --- Pins ---
 // NOTE: GPIO12 is an ESP32 boot strapping pin (MTDI). A servo signal here at power-on
 // can stop the board booting. If you hit boot failures, move the servo to e.g. GPIO13.
 #define SERVO_PIN  12
 #define BUZZER_PIN 14
+#define FLASH_LED_PIN 4   // AI-Thinker ESP32-CAM built-in white flash LED (active HIGH)
 
 // --- Camera Pins (AI Thinker ESP32-CAM) ---
 #define PWDN_GPIO_NUM     32
@@ -39,14 +40,17 @@ const String serverURL = "http://192.168.1.103:8080/verify";
 #define IDLE_INTERVAL_MS    1500   // normal polling cadence when nobody is recognized
 #define GRANT_COOLDOWN_MS  10000   // pause after an unlock so the door isn't re-opened
 #define DENY_COOLDOWN_MS    8000   // back off after a stranger so the buzzer doesn't spam
+#define LOWLIGHT_RECHECK_MS  300   // after lighting up, re-capture quickly to recognize
 
 // Decision returned by verifyFace()
 #define DOOR_GRANT   1   // owner matched          -> unlock
 #define DOOR_DENY    0   // face present, no match -> buzzer
 #define DOOR_IDLE   (-1) // no face / error        -> stay silent
+#define DOOR_LOWLIGHT 2   // frame too dark: LED just turned on, re-capture the lit frame
 
 Servo doorServo;
 unsigned long nextCheckTime = 0;
+bool ledOn = false;   // mirrors the physical GPIO 4 state; sent to the server each poll
 httpd_handle_t stream_httpd = NULL;
 
 // ---- MJPEG stream boundary ----
@@ -143,28 +147,49 @@ void triggerBuzzer() {
   }
 }
 
+// Drive GPIO 4 from the server's "led" field (tolerate an optional space after the colon).
+void applyLed(const String& response) {
+  if (response.indexOf("\"led\":\"on\"") >= 0 ||
+      response.indexOf("\"led\": \"on\"") >= 0) {
+    digitalWrite(FLASH_LED_PIN, HIGH);
+    ledOn = true;
+  } else if (response.indexOf("\"led\":\"off\"") >= 0 ||
+             response.indexOf("\"led\": \"off\"") >= 0) {
+    digitalWrite(FLASH_LED_PIN, LOW);
+    ledOn = false;
+  }
+}
+
 // Sends the frame to the Flask server and maps the JSON response to a door decision.
 int verifyFace(camera_fb_t* fb) {
   HTTPClient http;
   http.begin(serverURL);
   http.addHeader("Content-Type", "application/octet-stream");
+  http.addHeader("X-LED-State", ledOn ? "on" : "off");
   int code = http.POST(fb->buf, fb->len);
 
   if (code != 200) {
     Serial.println("Server error: " + String(code));
     http.end();
-    return DOOR_IDLE;            // unreachable/erroring server: do nothing this cycle
+    digitalWrite(FLASH_LED_PIN, LOW);   // never let the LED stick on if the server dies
+    ledOn = false;
+    return DOOR_IDLE;
   }
 
   String response = http.getString();
   Serial.println("Server response: " + response);
   http.end();
 
+  applyLed(response);   // honor the server's LED instruction before deciding the door action
+
   // The server guarantees the only literal "true" in the body is the verified field
   // (tolerate an optional space after the colon).
   if (response.indexOf("\"verified\":true") >= 0 ||
       response.indexOf("\"verified\": true") >= 0) {
     return DOOR_GRANT;
+  }
+  if (response.indexOf("low_light") >= 0) {
+    return DOOR_LOWLIGHT;       // dark: LED now on, re-capture the lit frame quickly
   }
   if (response.indexOf("no_face") >= 0) {
     return DOOR_IDLE;           // empty doorway: stay silent
@@ -175,6 +200,8 @@ int verifyFace(camera_fb_t* fb) {
 void setup() {
   Serial.begin(115200);
   pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(FLASH_LED_PIN, OUTPUT);
+  digitalWrite(FLASH_LED_PIN, LOW);   // start dark
   doorServo.attach(SERVO_PIN);
   doorServo.write(0);
 
@@ -229,6 +256,9 @@ void loop() {
     case DOOR_DENY:
       triggerBuzzer();
       nextCheckTime = millis() + DENY_COOLDOWN_MS;   // no every-5s buzzer spam
+      break;
+    case DOOR_LOWLIGHT:
+      nextCheckTime = millis() + LOWLIGHT_RECHECK_MS;  // LED just lit; recognize the lit frame
       break;
     default: // DOOR_IDLE
       nextCheckTime = millis() + IDLE_INTERVAL_MS;   // empty doorway: keep polling quietly
