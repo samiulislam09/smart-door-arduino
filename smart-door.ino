@@ -1,18 +1,14 @@
 #include "esp_camera.h"
 #include <WiFi.h>
 #include <HTTPClient.h>
-#include <ESP32Servo.h>
-#include "esp_http_server.h"   // <-- ADD THIS
+#include "esp_http_server.h"
 
-// --- তোমার তথ্য ---
-const char* ssid     = "Pirates";
-const char* password = "Bristy@12345";
-const String serverURL = "http://192.168.1.108:8080/verify";
+// --- WiFi + server ---
+const char* ssid     = "Redmi";
+const char* password = "1234567890";
+const String serverURL = "http://10.235.156.154:8080/verify";
 
 // --- Pins ---
-// NOTE: GPIO12 is an ESP32 boot strapping pin (MTDI). A servo signal here at power-on
-// can stop the board booting. If you hit boot failures, move the servo to e.g. GPIO13.
-#define SERVO_PIN  12
 #define BUZZER_PIN 14
 #define FLASH_LED_PIN 4   // AI-Thinker ESP32-CAM built-in white flash LED (active HIGH)
 
@@ -35,20 +31,17 @@ const String serverURL = "http://192.168.1.108:8080/verify";
 #define PCLK_GPIO_NUM     22
 
 // --- Verification timing / cooldowns ---
-// Server recognizes in ~0.3s, so polling ~1.5s keeps the door responsive (~1-2s to
-// react) without hammering the server.
 #define IDLE_INTERVAL_MS    1500   // normal polling cadence when nobody is recognized
-#define GRANT_COOLDOWN_MS  10000   // pause after an unlock so the door isn't re-opened
+#define GRANT_COOLDOWN_MS  10000   // pause after a match so we don't re-arm every 1.5s
 #define DENY_COOLDOWN_MS    8000   // back off after a stranger so the buzzer doesn't spam
 #define LOWLIGHT_RECHECK_MS  300   // after lighting up, re-capture quickly to recognize
 
 // Decision returned by verifyFace()
-#define DOOR_GRANT   1   // owner matched          -> unlock
+#define DOOR_GRANT   1   // face matched           -> server arms the unlock
 #define DOOR_DENY    0   // face present, no match -> buzzer
 #define DOOR_IDLE   (-1) // no face / error        -> stay silent
-#define DOOR_LOWLIGHT 2   // frame too dark: LED just turned on, re-capture the lit frame
+#define DOOR_LOWLIGHT 2  // frame too dark: LED just turned on, re-capture the lit frame
 
-Servo doorServo;
 unsigned long nextCheckTime = 0;
 bool ledOn = false;   // mirrors the physical GPIO 4 state; sent to the server each poll
 httpd_handle_t stream_httpd = NULL;
@@ -125,22 +118,14 @@ void initCamera() {
   config.pin_reset    = RESET_GPIO_NUM;
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
-  config.frame_size   = FRAMESIZE_VGA;   // 640x480 looks better for streaming
+  config.frame_size   = FRAMESIZE_VGA;
   config.jpeg_quality = 12;
-  config.fb_count     = 2;                // important for streaming
+  config.fb_count     = 2;
   esp_camera_init(&config);
 }
 
-void unlockDoor() {
-  Serial.println("✓ Access granted! Door opening...");
-  doorServo.write(90);
-  delay(5000);
-  doorServo.write(0);
-  Serial.println("Door locked again.");
-}
-
 void triggerBuzzer() {
-  Serial.println("✗ Access denied! Buzzer ON.");
+  Serial.println("Access denied! Buzzer ON.");
   for (int i = 0; i < 5; i++) {
     digitalWrite(BUZZER_PIN, HIGH); delay(200);
     digitalWrite(BUZZER_PIN, LOW);  delay(200);
@@ -171,7 +156,7 @@ int verifyFace(camera_fb_t* fb) {
   if (code != 200) {
     Serial.println("Server error: " + String(code));
     http.end();
-    digitalWrite(FLASH_LED_PIN, LOW);   // never let the LED stick on if the server dies
+    digitalWrite(FLASH_LED_PIN, LOW);
     ledOn = false;
     return DOOR_IDLE;
   }
@@ -180,21 +165,19 @@ int verifyFace(camera_fb_t* fb) {
   Serial.println("Server response: " + response);
   http.end();
 
-  applyLed(response);   // honor the server's LED instruction before deciding the door action
+  applyLed(response);
 
-  // The server guarantees the only literal "true" in the body is the verified field
-  // (tolerate an optional space after the colon).
   if (response.indexOf("\"verified\":true") >= 0 ||
       response.indexOf("\"verified\": true") >= 0) {
     return DOOR_GRANT;
   }
   if (response.indexOf("low_light") >= 0) {
-    return DOOR_LOWLIGHT;       // dark: LED now on, re-capture the lit frame quickly
+    return DOOR_LOWLIGHT;
   }
   if (response.indexOf("no_face") >= 0) {
-    return DOOR_IDLE;           // empty doorway: stay silent
+    return DOOR_IDLE;
   }
-  return DOOR_DENY;             // face present but not the owner
+  return DOOR_DENY;
 }
 
 void setup() {
@@ -202,8 +185,6 @@ void setup() {
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(FLASH_LED_PIN, OUTPUT);
   digitalWrite(FLASH_LED_PIN, LOW);   // start dark
-  doorServo.attach(SERVO_PIN);
-  doorServo.write(0);
 
   initCamera();
 
@@ -219,13 +200,6 @@ void setup() {
   Serial.print("Raw camera stream:  http://");
   Serial.print(WiFi.localIP());
   Serial.println(":81/stream");
-
-  // Annotated face-check viewer runs on the PC (Flask server), not the ESP32.
-  String viewURL = serverURL;
-  viewURL.replace("/verify", "/view");
-  Serial.print("Face-check viewer:  ");
-  Serial.println(viewURL);
-  Serial.println();
 
   startStreamServer();
   Serial.println("System ready.");
@@ -250,18 +224,18 @@ void loop() {
 
   switch (decision) {
     case DOOR_GRANT:
-      unlockDoor();                                  // opens, holds 5s, closes
-      nextCheckTime = millis() + GRANT_COOLDOWN_MS;  // no instant re-unlock
+      Serial.println("Face matched - server arms the unlock; lock board opens.");
+      nextCheckTime = millis() + GRANT_COOLDOWN_MS;
       break;
     case DOOR_DENY:
       triggerBuzzer();
-      nextCheckTime = millis() + DENY_COOLDOWN_MS;   // no every-5s buzzer spam
+      nextCheckTime = millis() + DENY_COOLDOWN_MS;
       break;
     case DOOR_LOWLIGHT:
-      nextCheckTime = millis() + LOWLIGHT_RECHECK_MS;  // LED just lit; recognize the lit frame
+      nextCheckTime = millis() + LOWLIGHT_RECHECK_MS;
       break;
     default: // DOOR_IDLE
-      nextCheckTime = millis() + IDLE_INTERVAL_MS;   // empty doorway: keep polling quietly
+      nextCheckTime = millis() + IDLE_INTERVAL_MS;
       break;
   }
 }
